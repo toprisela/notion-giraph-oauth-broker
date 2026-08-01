@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Wrangler / Cloudflare local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+
+# Build, coverage, and TypeScript cache
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

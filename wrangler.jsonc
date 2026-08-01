@@ -1,0 +1,32 @@
+{
+    "name": "giraph-oauth-broker",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-07-18",
+    "workers_dev": false,
+    "durable_objects": {
+      "bindings": [
+        {
+          "name": "OAUTH_STATE",
+          "class_name": "OAuthState"
+        }
+      ]
+    },
+    "migrations": [
+      {
+        "tag": "v1",
+        "new_sqlite_classes": ["OAuthState"]
+      }
+    ],
+    "vars": {
+      "NOTION_REDIRECT_URI": "https://auth.connectyourcharger.com/oauth/notion/callback",
+      "ALLOWED_RETURN_URIS": "http://localhost:41987/callback",
+      "OAUTH_ATTEMPT_TTL_SEC": "600",
+      "LOGIN_TICKET_TTL_SEC": "300"
+    },
+    "routes": [
+      {
+        "pattern": "auth.connectyourcharger.com",
+        "custom_domain": true
+      }
+    ]
+  }

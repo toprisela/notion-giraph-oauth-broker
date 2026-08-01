@@ -1,0 +1,28 @@
+{
+  "name": "notion-giraph-oauth-broker",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/toprisela/notion-giraph-oauth-broker.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/toprisela/notion-giraph-oauth-broker/issues"
+  },
+  "homepage": "https://github.com/toprisela/notion-giraph-oauth-broker#readme",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260718.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.112.0"
+  }
+}
