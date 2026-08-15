@@ -175,6 +175,11 @@ interface StoredRow {
   expires_at: number
 }
 
+interface NextExpiryRow {
+  [key: string]: SqlStorageValue
+  next_expiry: number | null
+}
+
 export class OAuthState extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -188,6 +193,7 @@ export class OAuthState extends DurableObject<Env> {
         )
       `)
       this.deleteExpired()
+      await this.scheduleNextCleanup()
     })
   }
 
@@ -209,11 +215,16 @@ export class OAuthState extends DurableObject<Env> {
     return json({ error: 'not_found' }, 404)
   }
 
+  async alarm(): Promise<void> {
+    this.deleteExpired()
+    await this.scheduleNextCleanup()
+  }
+
   private deleteExpired(): void {
     this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE expires_at <= ?', Date.now())
   }
 
-  private putItem(key: string, value: unknown, expiresAt: number): void {
+  private async putItem(key: string, value: unknown, expiresAt: number): Promise<void> {
     this.deleteExpired()
     this.ctx.storage.sql.exec(
       `
@@ -227,24 +238,41 @@ export class OAuthState extends DurableObject<Env> {
       JSON.stringify(value),
       expiresAt,
     )
+    await this.scheduleNextCleanup()
   }
 
-  private getItem<T>(key: string): T | null {
+  private async getItem<T>(key: string): Promise<T | null> {
     this.deleteExpired()
+    await this.scheduleNextCleanup()
     const row = this.ctx.storage.sql
       .exec<StoredRow>('SELECT value, expires_at FROM oauth_items WHERE key = ?', key)
       .toArray()[0]
 
     if (!row) return null
     if (row.expires_at <= Date.now()) {
-      this.deleteItem(key)
+      await this.deleteItem(key)
       return null
     }
     return JSON.parse(row.value) as T
   }
 
-  private deleteItem(key: string): void {
+  private async deleteItem(key: string): Promise<void> {
     this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE key = ?', key)
+    await this.scheduleNextCleanup()
+  }
+
+  private async scheduleNextCleanup(): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec<NextExpiryRow>('SELECT MIN(expires_at) AS next_expiry FROM oauth_items')
+      .toArray()[0]
+    const nextExpiry = row?.next_expiry
+
+    if (typeof nextExpiry !== 'number') {
+      await this.ctx.storage.deleteAlarm()
+      return
+    }
+
+    await this.ctx.storage.setAlarm(Math.max(nextExpiry, Date.now() + 1))
   }
 
   private async handleStart(request: Request): Promise<Response> {
@@ -268,7 +296,7 @@ export class OAuthState extends DurableObject<Env> {
       expiresAt,
     }
 
-    this.putItem(`state:${state}`, attempt, expiresAt)
+    await this.putItem(`state:${state}`, attempt, expiresAt)
 
     const authorize = new URL(NOTION_AUTHORIZE_URL)
     authorize.searchParams.set('client_id', this.env.NOTION_CLIENT_ID)
@@ -291,14 +319,14 @@ export class OAuthState extends DurableObject<Env> {
     const state = url.searchParams.get('state')
     if (!state) return this.renderFailure('Missing OAuth state.')
 
-    const attempt = this.getItem<OAuthAttempt>(`state:${state}`)
+    const attempt = await this.getItem<OAuthAttempt>(`state:${state}`)
     if (!attempt) {
       return this.renderFailure('OAuth attempt expired. Return to Giraph and try again.')
     }
 
     const error = url.searchParams.get('error')
     if (error) {
-      this.deleteItem(`state:${state}`)
+      await this.deleteItem(`state:${state}`)
       const target = new URL(attempt.appReturnUri)
       target.searchParams.set('error', error === 'access_denied' ? 'access_denied' : 'oauth_error')
       target.searchParams.set('attempt_id', attempt.attemptId)
@@ -329,8 +357,8 @@ export class OAuthState extends DurableObject<Env> {
       expiresAt: ticketExpiresAt,
     }
 
-    this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt)
-    this.deleteItem(`state:${state}`)
+    await this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt)
+    await this.deleteItem(`state:${state}`)
 
     const target = new URL(attempt.appReturnUri)
     target.searchParams.set('ticket', ticket)
@@ -349,12 +377,12 @@ export class OAuthState extends DurableObject<Env> {
       return json({ error: 'missing_ticket' }, 400)
     }
 
-    const stored = this.getItem<LoginTicket>(`ticket:${ticket}`)
+    const stored = await this.getItem<LoginTicket>(`ticket:${ticket}`)
     if (!stored || stored.attemptId !== attemptId) {
       return json({ error: 'invalid_or_expired_ticket' }, 401)
     }
 
-    this.deleteItem(`ticket:${ticket}`)
+    await this.deleteItem(`ticket:${ticket}`)
     return json(stored.tokenResponse)
   }
 

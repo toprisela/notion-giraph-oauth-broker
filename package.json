@@ -4,9 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "ci:local": "npm run typecheck && npm test && wrangler deploy --dry-run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run && node --test test/wrangler-config.test.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
   },
   "repository": {
     "type": "git",
@@ -21,8 +23,10 @@
   },
   "homepage": "https://github.com/toprisela/notion-giraph-oauth-broker#readme",
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^5.20260718.1",
     "typescript": "^7.0.2",
+    "vitest": "^4.1.0",
     "wrangler": "^4.112.0"
   }
 }

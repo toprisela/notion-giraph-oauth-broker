@@ -161,8 +161,15 @@ POST /oauth/notion/revoke    optional later
 - Later, add exact iPad return URIs only after the iPad app exists.
 - OAuth state and login tickets must be random, high entropy, short-lived, and
   one-time-use.
+- Every stored OAuth attempt and login ticket must schedule the Durable Object's
+  cleanup alarm for the earliest expiry. The alarm deletes expired rows and
+  reschedules itself until no OAuth data remains; expiry must never depend on a
+  later user request arriving.
 - Store Notion client secret only in Cloudflare secrets.
 - Do not log authorization codes, tickets, access tokens, or refresh tokens.
+- Disable persisted Workers invocation logs. OAuth callback query strings carry
+  short-lived authorization codes and state values, so request URLs must not be
+  retained. Keep Cloudflare's aggregate Worker metrics for operational health.
 - A network/broker failure must not cause the Giraph app to delete local tokens.
 - Refresh-token rotation must be atomic from the app's point of view: the app
   must replace both tokens only after a successful refresh response.
@@ -251,9 +258,11 @@ Update `package.json` scripts:
 ```json
 {
   "scripts": {
+    "ci:local": "npm run typecheck && npm test && wrangler deploy --dry-run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run && node --test test/wrangler-config.test.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
   }
 }
 ```
@@ -267,6 +276,14 @@ Create `wrangler.jsonc`:
   "name": "giraph-oauth-broker",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-18",
+  "observability": {
+    "enabled": false,
+    "logs": {
+      "enabled": false,
+      "invocation_logs": false,
+      "persist": false
+    }
+  },
   "durable_objects": {
     "bindings": [
       {
@@ -546,6 +563,10 @@ interface StoredRow {
   expires_at: number
 }
 
+interface NextExpiryRow {
+  next_expiry: number | null
+}
+
 interface StoredAbuseCounterRow {
   count: number
   reset_at: number
@@ -572,6 +593,7 @@ export class OAuthState {
         )
       `)
       this.deleteExpired()
+      await this.scheduleNextCleanup()
     })
   }
 
@@ -597,13 +619,18 @@ export class OAuthState {
     return json({ error: 'not_found' }, 404)
   }
 
+  async alarm(): Promise<void> {
+    this.deleteExpired()
+    await this.scheduleNextCleanup()
+  }
+
   private deleteExpired(): void {
     const now = Date.now()
     this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE expires_at <= ?', now)
     this.ctx.storage.sql.exec('DELETE FROM abuse_counters WHERE reset_at <= ?', now)
   }
 
-  private putItem(key: string, value: unknown, expiresAt: number): void {
+  private async putItem(key: string, value: unknown, expiresAt: number): Promise<void> {
     this.deleteExpired()
     this.ctx.storage.sql.exec(
       `
@@ -617,24 +644,41 @@ export class OAuthState {
       JSON.stringify(value),
       expiresAt,
     )
+    await this.scheduleNextCleanup()
   }
 
-  private getItem<T>(key: string): T | null {
+  private async getItem<T>(key: string): Promise<T | null> {
     this.deleteExpired()
+    await this.scheduleNextCleanup()
     const row = this.ctx.storage.sql
       .exec('SELECT value, expires_at FROM oauth_items WHERE key = ?', key)
       .one<StoredRow | null>()
 
     if (!row) return null
     if (row.expires_at <= Date.now()) {
-      this.deleteItem(key)
+      await this.deleteItem(key)
       return null
     }
     return JSON.parse(row.value) as T
   }
 
-  private deleteItem(key: string): void {
+  private async deleteItem(key: string): Promise<void> {
     this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE key = ?', key)
+    await this.scheduleNextCleanup()
+  }
+
+  private async scheduleNextCleanup(): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec('SELECT MIN(expires_at) AS next_expiry FROM oauth_items')
+      .one<NextExpiryRow | null>()
+    const nextExpiry = row?.next_expiry
+
+    if (typeof nextExpiry !== 'number') {
+      await this.ctx.storage.deleteAlarm()
+      return
+    }
+
+    await this.ctx.storage.setAlarm(Math.max(nextExpiry, Date.now() + 1))
   }
 
   private clientAbuseKey(scope: string, request: Request): string {
@@ -701,7 +745,7 @@ export class OAuthState {
       expiresAt,
     }
 
-    this.putItem(`state:${state}`, attempt, expiresAt)
+    await this.putItem(`state:${state}`, attempt, expiresAt)
 
     const authorize = new URL(NOTION_AUTHORIZE_URL)
     authorize.searchParams.set('client_id', this.env.NOTION_CLIENT_ID)
@@ -724,13 +768,13 @@ export class OAuthState {
     const state = url.searchParams.get('state')
     if (!state) return this.renderFailure('Missing OAuth state.')
 
-    const attempt = this.getItem<OAuthAttempt>(`state:${state}`)
+    const attempt = await this.getItem<OAuthAttempt>(`state:${state}`)
     if (!attempt)
       return this.renderFailure('OAuth attempt expired. Return to Giraph and try again.')
 
     const error = url.searchParams.get('error')
     if (error) {
-      this.deleteItem(`state:${state}`)
+      await this.deleteItem(`state:${state}`)
       const target = new URL(attempt.appReturnUri)
       target.searchParams.set('error', error === 'access_denied' ? 'access_denied' : 'oauth_error')
       target.searchParams.set('attempt_id', attempt.attemptId)
@@ -761,8 +805,8 @@ export class OAuthState {
       expiresAt: ticketExpiresAt,
     }
 
-    this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt)
-    this.deleteItem(`state:${state}`)
+    await this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt)
+    await this.deleteItem(`state:${state}`)
 
     const target = new URL(attempt.appReturnUri)
     target.searchParams.set('ticket', ticket)
@@ -791,12 +835,12 @@ export class OAuthState {
       return json({ error: 'missing_ticket' }, 400)
     }
 
-    const stored = this.getItem<LoginTicket>(`ticket:${ticket}`)
+    const stored = await this.getItem<LoginTicket>(`ticket:${ticket}`)
     if (!stored || stored.attemptId !== attemptId) {
       return json({ error: 'invalid_or_expired_ticket' }, 401)
     }
 
-    this.deleteItem(`ticket:${ticket}`)
+    await this.deleteItem(`ticket:${ticket}`)
     return json(stored.tokenResponse)
   }
 
@@ -1002,9 +1046,12 @@ Notion token exchange failures
 Notion refresh failures
 ```
 
-If you want endpoint-level counters later, add Cloudflare Workers Analytics
-Engine or structured logs. Do not add this in the first version unless the
-dashboard is not enough.
+Persisted Workers Logs are off (`observability.enabled`, `logs.enabled`,
+`invocation_logs`, and `persist` are all `false`) because OAuth callback
+URLs contain short-lived authorization codes and state values. Use the aggregate
+Workers metrics above. If endpoint-level counters are needed later, add
+allowlisted numeric metrics only; do not retain request URLs, query strings,
+headers, bodies, tokens, tickets, user ids, or workspace ids.
 
 ## Step 12: Add Basic Abuse Protection
 
@@ -1016,11 +1063,16 @@ creating accounts:
 - `appReturnUri` must exactly match one of `ALLOWED_RETURN_URIS`;
 - JSON request bodies are capped by `MAX_JSON_BODY_BYTES`;
 - OAuth attempts and login tickets use short TTLs;
+- Durable Object alarms physically delete expired OAuth attempts and login
+  tickets even if no later request arrives;
 - `/oauth/notion/start`, `/oauth/notion/complete`, and `/oauth/notion/refresh`
   have simple Durable Object-backed per-IP window counters;
 - Notion token exchange failures return generic broker errors;
 - the Worker code does not log secrets, authorization codes, tickets, access
   tokens, or refresh tokens.
+- persisted Workers Logs are off in `wrangler.jsonc`: `observability.enabled`,
+  `logs.enabled`, `invocation_logs`, and `persist` are all `false`. Aggregate
+  Worker metrics remain available without that switch.
 
 The abuse counters are intentionally modest, not a full account system. They
 exist to blunt broken clients and obvious scripts while keeping normal login and

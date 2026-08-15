@@ -3,6 +3,14 @@
     "main": "src/index.ts",
     "compatibility_date": "2026-07-18",
     "workers_dev": false,
+    "observability": {
+      "enabled": false,
+      "logs": {
+        "enabled": false,
+        "invocation_logs": false,
+        "persist": false
+      }
+    },
     "durable_objects": {
       "bindings": [
         {
