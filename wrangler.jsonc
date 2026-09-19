@@ -1,40 +1,74 @@
 {
-    "name": "giraph-oauth-broker",
-    "main": "src/index.ts",
-    "compatibility_date": "2026-07-18",
-    "workers_dev": false,
-    "observability": {
+  "name": "giraph-oauth-broker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-18",
+  "workers_dev": false,
+  "observability": {
+    "enabled": false,
+    "logs": {
       "enabled": false,
-      "logs": {
-        "enabled": false,
-        "invocation_logs": false,
-        "persist": false
-      }
+      "invocation_logs": false,
+      "persist": false,
     },
-    "durable_objects": {
-      "bindings": [
-        {
-          "name": "OAUTH_STATE",
-          "class_name": "OAuthState"
-        }
-      ]
-    },
-    "migrations": [
+  },
+  "durable_objects": {
+    "bindings": [
       {
-        "tag": "v1",
-        "new_sqlite_classes": ["OAuthState"]
-      }
+        "name": "OAUTH_STATE",
+        "class_name": "OAuthState",
+      },
     ],
-    "vars": {
-      "NOTION_REDIRECT_URI": "https://auth.connectyourcharger.com/oauth/notion/callback",
-      "ALLOWED_RETURN_URIS": "http://localhost:41987/callback",
-      "OAUTH_ATTEMPT_TTL_SEC": "600",
-      "LOGIN_TICKET_TTL_SEC": "300"
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["OAuthState"],
     },
-    "routes": [
-      {
-        "pattern": "auth.connectyourcharger.com",
-        "custom_domain": true
-      }
-    ]
-  }
+  ],
+  "secrets": {
+    "required": ["NOTION_CLIENT_ID", "NOTION_CLIENT_SECRET"],
+  },
+  "vars": {
+    "NOTION_REDIRECT_URI": "https://auth.connectyourcharger.com/oauth/notion/callback",
+    "ALLOWED_RETURN_URIS": "http://localhost:41987/callback",
+    "ALLOWED_IPAD_RETURN_URIS": "com.connectyourcharger.giraph.ipad:/oauth/callback",
+    "OAUTH_ATTEMPT_TTL_SEC": "600",
+    "LOGIN_TICKET_TTL_SEC": "300",
+  },
+  "routes": [
+    {
+      "pattern": "auth.connectyourcharger.com",
+      "custom_domain": true,
+    },
+  ],
+  "env": {
+    "staging": {
+      "name": "giraph-oauth-broker-staging",
+      "workers_dev": false,
+      "vars": {
+        "NOTION_REDIRECT_URI": "https://auth-staging.connectyourcharger.com/oauth/notion/callback",
+        "ALLOWED_RETURN_URIS": "http://localhost:41987/callback",
+        "ALLOWED_IPAD_RETURN_URIS": "com.connectyourcharger.giraph.ipad:/oauth/callback",
+        "OAUTH_ATTEMPT_TTL_SEC": "600",
+        "LOGIN_TICKET_TTL_SEC": "300",
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "OAUTH_STATE",
+            "class_name": "OAuthState",
+          },
+        ],
+      },
+      "secrets": {
+        "required": ["NOTION_CLIENT_ID", "NOTION_CLIENT_SECRET"],
+      },
+      "routes": [
+        {
+          "pattern": "auth-staging.connectyourcharger.com",
+          "custom_domain": true,
+        },
+      ],
+    },
+  },
+}

@@ -4,11 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "ci:local": "npm run typecheck && npm test && wrangler deploy --dry-run",
+    "ci:local": "wrangler types --check && npm run typecheck && npm test && wrangler deploy --env=\"\" --dry-run && wrangler deploy --env staging --dry-run",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --env=\"\"",
     "test": "vitest run && node --test test/wrangler-config.test.mjs",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "dev:staging": "wrangler dev --env staging",
+    "deploy:staging": "wrangler deploy --env staging"
   },
   "repository": {
     "type": "git",

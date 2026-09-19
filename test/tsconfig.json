@@ -3,10 +3,7 @@
   "compilerOptions": {
     "lib": ["ESNext"],
     "skipLibCheck": true,
-    "types": [
-      "@cloudflare/vitest-pool-workers/types",
-      "@cloudflare/workers-types"
-    ]
+    "types": ["@cloudflare/vitest-pool-workers/types"]
   },
-  "include": ["../src", "./**/*.ts"]
+  "include": ["../worker-configuration.d.ts", "../src", "./**/*.ts"]
 }

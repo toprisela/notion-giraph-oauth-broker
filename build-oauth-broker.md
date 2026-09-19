@@ -1,3 +1,6 @@
+> Current two-platform contract and staging/production procedure: [AUTHENTICATION.md](AUTHENTICATION.md).
+> This document also retains historical implementation examples; `src/index.ts` remains authoritative.
+
 # Build Guide: Giraph Notion OAuth Broker
 
 ## Goal
@@ -112,6 +115,12 @@ Broker returns tokens over HTTPS JSON
 Giraph stores tokens locally and calls Notion directly for sync
 ```
 
+iPad uses the same HTTPS callback and ticket handoff, but starts with
+`platform: "ipad"`, the exact
+`com.connectyourcharger.giraph.ipad:/oauth/callback` return URI, and an S256 PKCE
+challenge. The broker binds the challenge and platform to the ticket; the iPad
+redeems with the verifier after `ASWebAuthenticationSession` returns.
+
 Refresh:
 
 ```text
@@ -158,7 +167,13 @@ POST /oauth/notion/revoke    optional later
   http://localhost:41987/callback
   ```
 
-- Later, add exact iPad return URIs only after the iPad app exists.
+- Allow iPad only at exactly
+  `com.connectyourcharger.giraph.ipad:/oauth/callback`; require `platform: "ipad"`
+  and S256 PKCE for that return.
+- Bind every iPad ticket to its platform, attempt, and challenge. Wrong
+  verifier/platform/attempt must not consume the valid ticket.
+- Ticket consumption must be atomic. Exactly one of concurrent valid redemption
+  requests may succeed; every replay is rejected.
 - OAuth state and login tickets must be random, high entropy, short-lived, and
   one-time-use.
 - Every stored OAuth attempt and login ticket must schedule the Durable Object's
@@ -233,7 +248,7 @@ Commands:
 mkdir giraph-oauth-broker
 cd giraph-oauth-broker
 npm init -y
-npm install --save-dev wrangler typescript @cloudflare/workers-types
+npm install --save-dev wrangler typescript vitest @cloudflare/vitest-pool-workers
 mkdir src
 ```
 
@@ -246,10 +261,10 @@ Create `tsconfig.json`:
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "strict": true,
-    "types": ["@cloudflare/workers-types"],
+    "types": [],
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["worker-configuration.d.ts", "src"]
 }
 ```
 
@@ -258,7 +273,7 @@ Update `package.json` scripts:
 ```json
 {
   "scripts": {
-    "ci:local": "npm run typecheck && npm test && wrangler deploy --dry-run",
+    "ci:local": "wrangler types --check && npm run typecheck && npm test && wrangler deploy --dry-run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "vitest run && node --test test/wrangler-config.test.mjs",
@@ -275,14 +290,14 @@ Create `wrangler.jsonc`:
 {
   "name": "giraph-oauth-broker",
   "main": "src/index.ts",
-  "compatibility_date": "2026-07-18",
+  "compatibility_date": "2026-08-18",
   "observability": {
     "enabled": false,
     "logs": {
       "enabled": false,
       "invocation_logs": false,
-      "persist": false
-    }
+      "persist": false,
+    },
   },
   "durable_objects": {
     "bindings": [
@@ -298,9 +313,13 @@ Create `wrangler.jsonc`:
       "new_sqlite_classes": ["OAuthState"],
     },
   ],
+  "secrets": {
+    "required": ["NOTION_CLIENT_ID", "NOTION_CLIENT_SECRET"],
+  },
   "vars": {
     "NOTION_REDIRECT_URI": "https://auth.connectyourcharger.com/oauth/notion/callback",
     "ALLOWED_RETURN_URIS": "http://localhost:41987/callback",
+    "ALLOWED_IPAD_RETURN_URIS": "com.connectyourcharger.giraph.ipad:/oauth/callback",
     "OAUTH_ATTEMPT_TTL_SEC": "600",
     "LOGIN_TICKET_TTL_SEC": "300",
     "MAX_JSON_BODY_BYTES": "2048",
@@ -323,11 +342,8 @@ Notes:
 - `OAUTH_ATTEMPT_TTL_SEC=600` gives the user 10 minutes to complete Notion
   consent.
 - `LOGIN_TICKET_TTL_SEC=300` gives the app 5 minutes to redeem the broker ticket.
-- `MAX_JSON_BODY_BYTES=2048` is enough for the broker's tiny JSON payloads and
-  prevents accidentally buffering large request bodies.
-- The abuse-window limits are conservative per-IP caps for abnormal retry loops
-  and scripted traffic. They are intentionally generous for shared home or office
-  networks.
+- Request JSON is bounded in source at 8 KiB, including streamed bodies without
+  a declared content length.
 - The broker uses the dedicated `auth.connectyourcharger.com` hostname so it
   does not replace or intercept traffic for the root domain.
 
@@ -352,160 +368,186 @@ Do not commit secrets to Git.
 
 ## Step 6: Implement The Worker
 
-Create `src/index.ts`:
+`src/index.ts` in this repository is the source of truth. The expanded desktop
+scaffold below is retained only as historical explanation; do not copy it over
+the current implementation because it predates the generated environment
+types, platform-bound iPad PKCE, and atomic conditional ticket consumption.
 
 ```ts
 export interface Env {
-  OAUTH_STATE: DurableObjectNamespace<OAuthState>
-  NOTION_CLIENT_ID: string
-  NOTION_CLIENT_SECRET: string
-  NOTION_REDIRECT_URI: string
-  ALLOWED_RETURN_URIS: string
-  OAUTH_ATTEMPT_TTL_SEC: string
-  LOGIN_TICKET_TTL_SEC: string
-  MAX_JSON_BODY_BYTES: string
-  ABUSE_WINDOW_SEC: string
-  OAUTH_START_LIMIT_PER_WINDOW: string
-  TICKET_COMPLETE_LIMIT_PER_WINDOW: string
-  REFRESH_LIMIT_PER_WINDOW: string
+  OAUTH_STATE: DurableObjectNamespace<OAuthState>;
+  NOTION_CLIENT_ID: string;
+  NOTION_CLIENT_SECRET: string;
+  NOTION_REDIRECT_URI: string;
+  ALLOWED_RETURN_URIS: string;
+  OAUTH_ATTEMPT_TTL_SEC: string;
+  LOGIN_TICKET_TTL_SEC: string;
+  MAX_JSON_BODY_BYTES: string;
+  ABUSE_WINDOW_SEC: string;
+  OAUTH_START_LIMIT_PER_WINDOW: string;
+  TICKET_COMPLETE_LIMIT_PER_WINDOW: string;
+  REFRESH_LIMIT_PER_WINDOW: string;
 }
 
-type Json = Record<string, unknown>
+type Json = Record<string, unknown>;
 
 type JsonParseResult =
   | { ok: true; body: Record<string, unknown> }
-  | { ok: false; response: Response }
+  | { ok: false; response: Response };
 
-type TextReadResult = { ok: true; text: string } | { ok: false; response: Response }
+type TextReadResult =
+  | { ok: true; text: string }
+  | { ok: false; response: Response };
 
-const NOTION_AUTHORIZE_URL = 'https://api.notion.com/v1/oauth/authorize'
-const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token'
+const NOTION_AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize";
+const NOTION_TOKEN_URL = "https://api.notion.com/v1/oauth/token";
 
-function json(body: Json, status = 200, extraHeaders: Record<string, string> = {}): Response {
+function json(
+  body: Json,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
       ...extraHeaders,
     },
-  })
+  });
 }
 
 function methodNotAllowed(): Response {
-  return json({ error: 'method_not_allowed' }, 405)
+  return json({ error: "method_not_allowed" }, 405);
 }
 
 function randomId(bytes = 32): string {
-  const data = new Uint8Array(bytes)
-  crypto.getRandomValues(data)
-  return [...data].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  const data = new Uint8Array(bytes);
+  crypto.getRandomValues(data);
+  return [...data].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function allowedReturnUris(env: Env): Set<string> {
   return new Set(
-    env.ALLOWED_RETURN_URIS.split(',')
+    env.ALLOWED_RETURN_URIS.split(",")
       .map((value) => value.trim())
       .filter(Boolean),
-  )
+  );
 }
 
 function isAllowedReturnUri(env: Env, uri: string): boolean {
-  return allowedReturnUris(env).has(uri)
+  return allowedReturnUris(env).has(uri);
 }
 
 function oauthStateObject(env: Env): DurableObjectStub {
-  const id = env.OAUTH_STATE.idFromName('global-oauth-state')
-  return env.OAUTH_STATE.get(id)
+  const id = env.OAUTH_STATE.idFromName("global-oauth-state");
+  return env.OAUTH_STATE.get(id);
 }
 
 function isLocalDevelopmentRequest(url: URL): boolean {
-  return url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]'
+  return (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]"
+  );
 }
 
 function isHttpsRequest(request: Request, url: URL): boolean {
-  if (url.protocol === 'https:') return true
-  return request.headers.get('cf-visitor')?.includes('"scheme":"https"') ?? false
+  if (url.protocol === "https:") return true;
+  return (
+    request.headers.get("cf-visitor")?.includes('"scheme":"https"') ?? false
+  );
 }
 
 function maxJsonBodyBytes(env: Env): number {
-  return Number(env.MAX_JSON_BODY_BYTES || '2048')
+  return Number(env.MAX_JSON_BODY_BYTES || "2048");
 }
 
-async function readTextWithLimit(request: Request, maxBytes: number): Promise<TextReadResult> {
-  const contentLength = request.headers.get('content-length')
+async function readTextWithLimit(
+  request: Request,
+  maxBytes: number,
+): Promise<TextReadResult> {
+  const contentLength = request.headers.get("content-length");
   if (contentLength !== null && Number(contentLength) > maxBytes) {
-    return { ok: false, response: json({ error: 'request_too_large' }, 413) }
+    return { ok: false, response: json({ error: "request_too_large" }, 413) };
   }
 
-  if (!request.body) return { ok: true, text: '' }
+  if (!request.body) return { ok: true, text: "" };
 
-  const reader = request.body.getReader()
-  const chunks: Uint8Array[] = []
-  let totalBytes = 0
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
 
   while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (!value) continue
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
 
-    totalBytes += value.byteLength
+    totalBytes += value.byteLength;
     if (totalBytes > maxBytes) {
-      await reader.cancel()
-      return { ok: false, response: json({ error: 'request_too_large' }, 413) }
+      await reader.cancel();
+      return { ok: false, response: json({ error: "request_too_large" }, 413) };
     }
 
-    chunks.push(value)
+    chunks.push(value);
   }
 
-  const body = new Uint8Array(totalBytes)
-  let offset = 0
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
   for (const chunk of chunks) {
-    body.set(chunk, offset)
-    offset += chunk.byteLength
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
   }
 
-  return { ok: true, text: new TextDecoder().decode(body) }
+  return { ok: true, text: new TextDecoder().decode(body) };
 }
 
-async function parseJsonRequest(request: Request, maxBytes: number): Promise<JsonParseResult> {
-  const read = await readTextWithLimit(request, maxBytes)
-  if (!read.ok) return read
+async function parseJsonRequest(
+  request: Request,
+  maxBytes: number,
+): Promise<JsonParseResult> {
+  const read = await readTextWithLimit(request, maxBytes);
+  if (!read.ok) return read;
 
   try {
-    const parsed = read.text.length > 0 ? JSON.parse(read.text) : {}
+    const parsed = read.text.length > 0 ? JSON.parse(read.text) : {};
     const body =
-      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
         ? (parsed as Record<string, unknown>)
-        : {}
-    return { ok: true, body }
+        : {};
+    return { ok: true, body };
   } catch {
-    return { ok: false, response: json({ error: 'invalid_json' }, 400) }
+    return { ok: false, response: json({ error: "invalid_json" }, 400) };
   }
 }
 
-async function exchangeWithNotion(env: Env, body: Record<string, unknown>): Promise<Response> {
-  const basic = btoa(`${env.NOTION_CLIENT_ID}:${env.NOTION_CLIENT_SECRET}`)
+async function exchangeWithNotion(
+  env: Env,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const basic = btoa(`${env.NOTION_CLIENT_ID}:${env.NOTION_CLIENT_SECRET}`);
   return fetch(NOTION_TOKEN_URL, {
-    method: 'POST',
+    method: "POST",
     headers: {
       authorization: `Basic ${basic}`,
-      'content-type': 'application/json',
+      "content-type": "application/json",
     },
     body: JSON.stringify(body),
-  })
+  });
 }
 
 function normalizeTokenResponse(data: Record<string, unknown>): Json {
   const expiresInSec =
-    typeof data.expires_in === 'number'
+    typeof data.expires_in === "number"
       ? data.expires_in
-      : typeof data.expiresInSec === 'number'
+      : typeof data.expiresInSec === "number"
         ? data.expiresInSec
-        : null
-  const issuedAt = new Date()
+        : null;
+  const issuedAt = new Date();
   const accessTokenExpiresAt =
-    expiresInSec === null ? null : new Date(issuedAt.getTime() + expiresInSec * 1000).toISOString()
+    expiresInSec === null
+      ? null
+      : new Date(issuedAt.getTime() + expiresInSec * 1000).toISOString();
 
   return {
     accessToken: data.access_token,
@@ -518,58 +560,58 @@ function normalizeTokenResponse(data: Record<string, unknown>): Json {
     accessTokenIssuedAt: issuedAt.toISOString(),
     accessTokenExpiresAt,
     accessTokenExpiresInSec: expiresInSec,
-  }
+  };
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url)
+    const url = new URL(request.url);
 
     if (!isLocalDevelopmentRequest(url) && !isHttpsRequest(request, url)) {
-      return json({ error: 'https_required' }, 403)
+      return json({ error: "https_required" }, 403);
     }
 
-    if (url.pathname === '/health') {
-      return json({ ok: true, service: 'giraph-oauth-broker' })
+    if (url.pathname === "/health") {
+      return json({ ok: true, service: "giraph-oauth-broker" });
     }
 
     if (
-      url.pathname === '/oauth/notion/start' ||
-      url.pathname === '/oauth/notion/callback' ||
-      url.pathname === '/oauth/notion/complete' ||
-      url.pathname === '/oauth/notion/refresh'
+      url.pathname === "/oauth/notion/start" ||
+      url.pathname === "/oauth/notion/callback" ||
+      url.pathname === "/oauth/notion/complete" ||
+      url.pathname === "/oauth/notion/refresh"
     ) {
-      return oauthStateObject(env).fetch(request)
+      return oauthStateObject(env).fetch(request);
     }
 
-    return json({ error: 'not_found' }, 404)
+    return json({ error: "not_found" }, 404);
   },
-}
+};
 
 interface OAuthAttempt {
-  attemptId: string
-  appReturnUri: string
-  expiresAt: number
+  attemptId: string;
+  appReturnUri: string;
+  expiresAt: number;
 }
 
 interface LoginTicket {
-  attemptId: string
-  tokenResponse: Json
-  expiresAt: number
+  attemptId: string;
+  tokenResponse: Json;
+  expiresAt: number;
 }
 
 interface StoredRow {
-  value: string
-  expires_at: number
+  value: string;
+  expires_at: number;
 }
 
 interface NextExpiryRow {
-  next_expiry: number | null
+  next_expiry: number | null;
 }
 
 interface StoredAbuseCounterRow {
-  count: number
-  reset_at: number
+  count: number;
+  reset_at: number;
 }
 
 export class OAuthState {
@@ -584,54 +626,64 @@ export class OAuthState {
           value TEXT NOT NULL,
           expires_at INTEGER NOT NULL
         )
-      `)
+      `);
       this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS abuse_counters (
           key TEXT PRIMARY KEY,
           count INTEGER NOT NULL,
           reset_at INTEGER NOT NULL
         )
-      `)
-      this.deleteExpired()
-      await this.scheduleNextCleanup()
-    })
+      `);
+      this.deleteExpired();
+      await this.scheduleNextCleanup();
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url)
+    const url = new URL(request.url);
 
-    if (url.pathname === '/oauth/notion/start') {
-      return this.handleStart(request)
+    if (url.pathname === "/oauth/notion/start") {
+      return this.handleStart(request);
     }
 
-    if (url.pathname === '/oauth/notion/callback') {
-      return this.handleCallback(request)
+    if (url.pathname === "/oauth/notion/callback") {
+      return this.handleCallback(request);
     }
 
-    if (url.pathname === '/oauth/notion/complete') {
-      return this.handleComplete(request)
+    if (url.pathname === "/oauth/notion/complete") {
+      return this.handleComplete(request);
     }
 
-    if (url.pathname === '/oauth/notion/refresh') {
-      return this.handleRefresh(request)
+    if (url.pathname === "/oauth/notion/refresh") {
+      return this.handleRefresh(request);
     }
 
-    return json({ error: 'not_found' }, 404)
+    return json({ error: "not_found" }, 404);
   }
 
   async alarm(): Promise<void> {
-    this.deleteExpired()
-    await this.scheduleNextCleanup()
+    this.deleteExpired();
+    await this.scheduleNextCleanup();
   }
 
   private deleteExpired(): void {
-    const now = Date.now()
-    this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE expires_at <= ?', now)
-    this.ctx.storage.sql.exec('DELETE FROM abuse_counters WHERE reset_at <= ?', now)
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      "DELETE FROM oauth_items WHERE expires_at <= ?",
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM abuse_counters WHERE reset_at <= ?",
+      now,
+    );
   }
 
-  private async putItem(key: string, value: unknown, expiresAt: number): Promise<void> {
-    this.deleteExpired()
+  private async putItem(
+    key: string,
+    value: unknown,
+    expiresAt: number,
+  ): Promise<void> {
+    this.deleteExpired();
     this.ctx.storage.sql.exec(
       `
         INSERT INTO oauth_items (key, value, expires_at)
@@ -643,245 +695,266 @@ export class OAuthState {
       key,
       JSON.stringify(value),
       expiresAt,
-    )
-    await this.scheduleNextCleanup()
+    );
+    await this.scheduleNextCleanup();
   }
 
   private async getItem<T>(key: string): Promise<T | null> {
-    this.deleteExpired()
-    await this.scheduleNextCleanup()
+    this.deleteExpired();
+    await this.scheduleNextCleanup();
     const row = this.ctx.storage.sql
-      .exec('SELECT value, expires_at FROM oauth_items WHERE key = ?', key)
-      .one<StoredRow | null>()
+      .exec("SELECT value, expires_at FROM oauth_items WHERE key = ?", key)
+      .one<StoredRow | null>();
 
-    if (!row) return null
+    if (!row) return null;
     if (row.expires_at <= Date.now()) {
-      await this.deleteItem(key)
-      return null
+      await this.deleteItem(key);
+      return null;
     }
-    return JSON.parse(row.value) as T
+    return JSON.parse(row.value) as T;
   }
 
   private async deleteItem(key: string): Promise<void> {
-    this.ctx.storage.sql.exec('DELETE FROM oauth_items WHERE key = ?', key)
-    await this.scheduleNextCleanup()
+    this.ctx.storage.sql.exec("DELETE FROM oauth_items WHERE key = ?", key);
+    await this.scheduleNextCleanup();
   }
 
   private async scheduleNextCleanup(): Promise<void> {
     const row = this.ctx.storage.sql
-      .exec('SELECT MIN(expires_at) AS next_expiry FROM oauth_items')
-      .one<NextExpiryRow | null>()
-    const nextExpiry = row?.next_expiry
+      .exec("SELECT MIN(expires_at) AS next_expiry FROM oauth_items")
+      .one<NextExpiryRow | null>();
+    const nextExpiry = row?.next_expiry;
 
-    if (typeof nextExpiry !== 'number') {
-      await this.ctx.storage.deleteAlarm()
-      return
+    if (typeof nextExpiry !== "number") {
+      await this.ctx.storage.deleteAlarm();
+      return;
     }
 
-    await this.ctx.storage.setAlarm(Math.max(nextExpiry, Date.now() + 1))
+    await this.ctx.storage.setAlarm(Math.max(nextExpiry, Date.now() + 1));
   }
 
   private clientAbuseKey(scope: string, request: Request): string {
-    return `abuse:${scope}:${request.headers.get('cf-connecting-ip') || 'local-dev'}`
+    return `abuse:${scope}:${request.headers.get("cf-connecting-ip") || "local-dev"}`;
   }
 
-  private checkRateLimit(scope: string, request: Request, limit: number): Response | null {
-    this.deleteExpired()
+  private checkRateLimit(
+    scope: string,
+    request: Request,
+    limit: number,
+  ): Response | null {
+    this.deleteExpired();
 
-    const now = Date.now()
-    const windowMs = Number(this.env.ABUSE_WINDOW_SEC || '60') * 1000
-    const key = this.clientAbuseKey(scope, request)
+    const now = Date.now();
+    const windowMs = Number(this.env.ABUSE_WINDOW_SEC || "60") * 1000;
+    const key = this.clientAbuseKey(scope, request);
     const row = this.ctx.storage.sql
-      .exec('SELECT count, reset_at FROM abuse_counters WHERE key = ?', key)
-      .one<StoredAbuseCounterRow | null>()
+      .exec("SELECT count, reset_at FROM abuse_counters WHERE key = ?", key)
+      .one<StoredAbuseCounterRow | null>();
 
     if (!row || row.reset_at <= now) {
       this.ctx.storage.sql.exec(
-        'INSERT OR REPLACE INTO abuse_counters (key, count, reset_at) VALUES (?, ?, ?)',
+        "INSERT OR REPLACE INTO abuse_counters (key, count, reset_at) VALUES (?, ?, ?)",
         key,
         1,
         now + windowMs,
-      )
-      return null
+      );
+      return null;
     }
 
     if (row.count >= limit) {
-      const retryAfter = Math.max(1, Math.ceil((row.reset_at - now) / 1000))
-      return json({ error: 'rate_limited' }, 429, { 'retry-after': String(retryAfter) })
+      const retryAfter = Math.max(1, Math.ceil((row.reset_at - now) / 1000));
+      return json({ error: "rate_limited" }, 429, {
+        "retry-after": String(retryAfter),
+      });
     }
 
-    this.ctx.storage.sql.exec('UPDATE abuse_counters SET count = count + 1 WHERE key = ?', key)
-    return null
+    this.ctx.storage.sql.exec(
+      "UPDATE abuse_counters SET count = count + 1 WHERE key = ?",
+      key,
+    );
+    return null;
   }
 
   private async handleStart(request: Request): Promise<Response> {
-    if (request.method !== 'POST') return methodNotAllowed()
+    if (request.method !== "POST") return methodNotAllowed();
 
     const limited = this.checkRateLimit(
-      'oauth_start',
+      "oauth_start",
       request,
-      Number(this.env.OAUTH_START_LIMIT_PER_WINDOW || '30'),
-    )
-    if (limited) return limited
+      Number(this.env.OAUTH_START_LIMIT_PER_WINDOW || "30"),
+    );
+    if (limited) return limited;
 
-    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env))
-    if (!parsed.ok) return parsed.response
+    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env));
+    if (!parsed.ok) return parsed.response;
 
-    const body = parsed.body
-    const appReturnUri = body.appReturnUri
+    const body = parsed.body;
+    const appReturnUri = body.appReturnUri;
 
-    if (typeof appReturnUri !== 'string' || !isAllowedReturnUri(this.env, appReturnUri)) {
-      return json({ error: 'invalid_return_uri' }, 400)
+    if (
+      typeof appReturnUri !== "string" ||
+      !isAllowedReturnUri(this.env, appReturnUri)
+    ) {
+      return json({ error: "invalid_return_uri" }, 400);
     }
 
-    const state = randomId()
-    const attemptId = randomId(16)
-    const ttlMs = Number(this.env.OAUTH_ATTEMPT_TTL_SEC || '600') * 1000
-    const expiresAt = Date.now() + ttlMs
+    const state = randomId();
+    const attemptId = randomId(16);
+    const ttlMs = Number(this.env.OAUTH_ATTEMPT_TTL_SEC || "600") * 1000;
+    const expiresAt = Date.now() + ttlMs;
 
     const attempt: OAuthAttempt = {
       attemptId,
       appReturnUri,
       expiresAt,
-    }
+    };
 
-    await this.putItem(`state:${state}`, attempt, expiresAt)
+    await this.putItem(`state:${state}`, attempt, expiresAt);
 
-    const authorize = new URL(NOTION_AUTHORIZE_URL)
-    authorize.searchParams.set('client_id', this.env.NOTION_CLIENT_ID)
-    authorize.searchParams.set('redirect_uri', this.env.NOTION_REDIRECT_URI)
-    authorize.searchParams.set('response_type', 'code')
-    authorize.searchParams.set('owner', 'user')
-    authorize.searchParams.set('state', state)
+    const authorize = new URL(NOTION_AUTHORIZE_URL);
+    authorize.searchParams.set("client_id", this.env.NOTION_CLIENT_ID);
+    authorize.searchParams.set("redirect_uri", this.env.NOTION_REDIRECT_URI);
+    authorize.searchParams.set("response_type", "code");
+    authorize.searchParams.set("owner", "user");
+    authorize.searchParams.set("state", state);
 
     return json({
       authorizeUrl: authorize.toString(),
       attemptId,
       expiresAt: new Date(expiresAt).toISOString(),
-    })
+    });
   }
 
   private async handleCallback(request: Request): Promise<Response> {
-    if (request.method !== 'GET') return methodNotAllowed()
+    if (request.method !== "GET") return methodNotAllowed();
 
-    const url = new URL(request.url)
-    const state = url.searchParams.get('state')
-    if (!state) return this.renderFailure('Missing OAuth state.')
+    const url = new URL(request.url);
+    const state = url.searchParams.get("state");
+    if (!state) return this.renderFailure("Missing OAuth state.");
 
-    const attempt = await this.getItem<OAuthAttempt>(`state:${state}`)
+    const attempt = await this.getItem<OAuthAttempt>(`state:${state}`);
     if (!attempt)
-      return this.renderFailure('OAuth attempt expired. Return to Giraph and try again.')
+      return this.renderFailure(
+        "OAuth attempt expired. Return to Giraph and try again.",
+      );
 
-    const error = url.searchParams.get('error')
+    const error = url.searchParams.get("error");
     if (error) {
-      await this.deleteItem(`state:${state}`)
-      const target = new URL(attempt.appReturnUri)
-      target.searchParams.set('error', error === 'access_denied' ? 'access_denied' : 'oauth_error')
-      target.searchParams.set('attempt_id', attempt.attemptId)
-      return Response.redirect(target.toString(), 302)
+      await this.deleteItem(`state:${state}`);
+      const target = new URL(attempt.appReturnUri);
+      target.searchParams.set(
+        "error",
+        error === "access_denied" ? "access_denied" : "oauth_error",
+      );
+      target.searchParams.set("attempt_id", attempt.attemptId);
+      return Response.redirect(target.toString(), 302);
     }
 
-    const code = url.searchParams.get('code')
-    if (!code) return this.renderFailure('Missing authorization code.')
+    const code = url.searchParams.get("code");
+    if (!code) return this.renderFailure("Missing authorization code.");
 
     const notionResponse = await exchangeWithNotion(this.env, {
-      grant_type: 'authorization_code',
+      grant_type: "authorization_code",
       code,
       redirect_uri: this.env.NOTION_REDIRECT_URI,
-    })
+    });
 
     if (!notionResponse.ok) {
-      return this.renderFailure('Token exchange failed. Return to Giraph and try again.')
+      return this.renderFailure(
+        "Token exchange failed. Return to Giraph and try again.",
+      );
     }
 
-    const notionData = (await notionResponse.json()) as Record<string, unknown>
-    const ticket = randomId()
-    const ticketTtlMs = Number(this.env.LOGIN_TICKET_TTL_SEC || '300') * 1000
-    const ticketExpiresAt = Date.now() + ticketTtlMs
+    const notionData = (await notionResponse.json()) as Record<string, unknown>;
+    const ticket = randomId();
+    const ticketTtlMs = Number(this.env.LOGIN_TICKET_TTL_SEC || "300") * 1000;
+    const ticketExpiresAt = Date.now() + ticketTtlMs;
 
     const loginTicket: LoginTicket = {
       attemptId: attempt.attemptId,
       tokenResponse: normalizeTokenResponse(notionData),
       expiresAt: ticketExpiresAt,
-    }
+    };
 
-    await this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt)
-    await this.deleteItem(`state:${state}`)
+    await this.putItem(`ticket:${ticket}`, loginTicket, ticketExpiresAt);
+    await this.deleteItem(`state:${state}`);
 
-    const target = new URL(attempt.appReturnUri)
-    target.searchParams.set('ticket', ticket)
-    target.searchParams.set('attempt_id', attempt.attemptId)
-    return Response.redirect(target.toString(), 302)
+    const target = new URL(attempt.appReturnUri);
+    target.searchParams.set("ticket", ticket);
+    target.searchParams.set("attempt_id", attempt.attemptId);
+    return Response.redirect(target.toString(), 302);
   }
 
   private async handleComplete(request: Request): Promise<Response> {
-    if (request.method !== 'POST') return methodNotAllowed()
+    if (request.method !== "POST") return methodNotAllowed();
 
     const limited = this.checkRateLimit(
-      'ticket_complete',
+      "ticket_complete",
       request,
-      Number(this.env.TICKET_COMPLETE_LIMIT_PER_WINDOW || '60'),
-    )
-    if (limited) return limited
+      Number(this.env.TICKET_COMPLETE_LIMIT_PER_WINDOW || "60"),
+    );
+    if (limited) return limited;
 
-    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env))
-    if (!parsed.ok) return parsed.response
+    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env));
+    if (!parsed.ok) return parsed.response;
 
-    const body = parsed.body
-    const ticket = body.ticket
-    const attemptId = body.attemptId
+    const body = parsed.body;
+    const ticket = body.ticket;
+    const attemptId = body.attemptId;
 
-    if (typeof ticket !== 'string' || typeof attemptId !== 'string') {
-      return json({ error: 'missing_ticket' }, 400)
+    if (typeof ticket !== "string" || typeof attemptId !== "string") {
+      return json({ error: "missing_ticket" }, 400);
     }
 
-    const stored = await this.getItem<LoginTicket>(`ticket:${ticket}`)
+    const stored = await this.getItem<LoginTicket>(`ticket:${ticket}`);
     if (!stored || stored.attemptId !== attemptId) {
-      return json({ error: 'invalid_or_expired_ticket' }, 401)
+      return json({ error: "invalid_or_expired_ticket" }, 401);
     }
 
-    await this.deleteItem(`ticket:${ticket}`)
-    return json(stored.tokenResponse)
+    await this.deleteItem(`ticket:${ticket}`);
+    return json(stored.tokenResponse);
   }
 
   private async handleRefresh(request: Request): Promise<Response> {
-    if (request.method !== 'POST') return methodNotAllowed()
+    if (request.method !== "POST") return methodNotAllowed();
 
     const limited = this.checkRateLimit(
-      'refresh',
+      "refresh",
       request,
-      Number(this.env.REFRESH_LIMIT_PER_WINDOW || '120'),
-    )
-    if (limited) return limited
+      Number(this.env.REFRESH_LIMIT_PER_WINDOW || "120"),
+    );
+    if (limited) return limited;
 
-    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env))
-    if (!parsed.ok) return parsed.response
+    const parsed = await parseJsonRequest(request, maxJsonBodyBytes(this.env));
+    if (!parsed.ok) return parsed.response;
 
-    const refreshToken = parsed.body.refreshToken
+    const refreshToken = parsed.body.refreshToken;
 
-    if (typeof refreshToken !== 'string' || refreshToken.length === 0) {
-      return json({ error: 'missing_refresh_token' }, 400)
+    if (typeof refreshToken !== "string" || refreshToken.length === 0) {
+      return json({ error: "missing_refresh_token" }, 400);
     }
 
     const notionResponse = await exchangeWithNotion(this.env, {
-      grant_type: 'refresh_token',
+      grant_type: "refresh_token",
       refresh_token: refreshToken,
-    })
+    });
 
     if (!notionResponse.ok) {
       return json(
         {
           error:
             notionResponse.status === 400 || notionResponse.status === 401
-              ? 'invalid_refresh_token'
-              : 'notion_refresh_failed',
+              ? "invalid_refresh_token"
+              : "notion_refresh_failed",
         },
-        notionResponse.status === 400 || notionResponse.status === 401 ? 401 : 502,
-      )
+        notionResponse.status === 400 || notionResponse.status === 401
+          ? 401
+          : 502,
+      );
     }
 
-    const data = (await notionResponse.json()) as Record<string, unknown>
-    return json(normalizeTokenResponse(data))
+    const data = (await notionResponse.json()) as Record<string, unknown>;
+    return json(normalizeTokenResponse(data));
   }
 
   private renderFailure(message: string): Response {
@@ -896,24 +969,24 @@ export class OAuthState {
           <p>${escapeHtml(message)}</p>
           <p>You can close this tab and return to Giraph.</p>
         </body>
-      </html>`
+      </html>`;
     return new Response(html, {
       status: 400,
       headers: {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
       },
-    })
+    });
   }
 }
 
 function escapeHtml(value: string): string {
   return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;')
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 ```
 
@@ -927,8 +1000,8 @@ npm run typecheck
 
 If TypeScript reports Cloudflare-specific typing issues, make sure:
 
-- `@cloudflare/workers-types` is installed;
-- `tsconfig.json` includes `"types": ["@cloudflare/workers-types"]`;
+- `wrangler types --check` reports `worker-configuration.d.ts` is current;
+- `tsconfig.json` includes the generated `worker-configuration.d.ts`;
 - `wrangler.jsonc` declares the Durable Object binding and migration.
 
 ## Step 8: Run Locally
@@ -1055,18 +1128,17 @@ headers, bodies, tokens, tickets, user ids, or workspace ids.
 
 ## Step 12: Add Basic Abuse Protection
 
-The Worker code above already includes the first-version abuse protection without
+The deployed Worker includes the following first-version controls without
 creating accounts:
 
-- production requests must arrive over HTTPS; local `localhost` development is
-  exempt;
-- `appReturnUri` must exactly match one of `ALLOWED_RETURN_URIS`;
-- JSON request bodies are capped by `MAX_JSON_BODY_BYTES`;
+- desktop and iPad return URIs use separate exact allowlists;
+- iPad start and completion require platform-bound S256 PKCE;
+- JSON request bodies are capped at 8 KiB;
 - OAuth attempts and login tickets use short TTLs;
 - Durable Object alarms physically delete expired OAuth attempts and login
   tickets even if no later request arrives;
-- `/oauth/notion/start`, `/oauth/notion/complete`, and `/oauth/notion/refresh`
-  have simple Durable Object-backed per-IP window counters;
+- ticket consumption uses an atomic conditional delete, so only one concurrent
+  request can redeem it;
 - Notion token exchange failures return generic broker errors;
 - the Worker code does not log secrets, authorization codes, tickets, access
   tokens, or refresh tokens.
@@ -1074,9 +1146,9 @@ creating accounts:
   `logs.enabled`, `invocation_logs`, and `persist` are all `false`. Aggregate
   Worker metrics remain available without that switch.
 
-The abuse counters are intentionally modest, not a full account system. They
-exist to blunt broken clients and obvious scripts while keeping normal login and
-refresh flows boring.
+Cloudflare WAF/rate limiting remains an operational control to configure from
+measured traffic; there are no source-level per-IP counters in the current
+Worker.
 
 Suggested Cloudflare WAF/rate limit later:
 
@@ -1099,7 +1171,7 @@ Start OAuth:
 ```shell
 curl -X POST https://auth.connectyourcharger.com/oauth/notion/start \
   -H 'content-type: application/json' \
-  -d '{"platform":"electron","appReturnUri":"http://localhost:41987/callback"}'
+  -d '{"platform":"desktop","appReturnUri":"http://localhost:41987/callback"}'
 ```
 
 Expected:
